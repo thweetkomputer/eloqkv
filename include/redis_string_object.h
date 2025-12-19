@@ -105,18 +105,20 @@ public:
         // Because we only store the serialized bytes in kvstore, we need the
         // object type to specify which kind of redis object to create and
         // deserialize it when do read.
+        // 1) serialize into vector<char>
         int64_t start = butil::cpuwide_time_us();
 
         const auto str_view = str_obj_.StringView();
         const uint32_t blob_len = str_view.size();
 
         const size_t total =
-            sizeof(int8_t) + sizeof(uint32_t) + blob_len;
+            sizeof(int8_t) + sizeof(uint32_t) + blob_len + 1;
 
-        const size_t old_size = str.size();
-        str.resize(old_size + total);
+        std::vector<char> buf;
+        buf.reserve(total);
+        buf.resize(total);
 
-        char* p = str.data() + old_size;
+        char* p = buf.data();
 
         *p = static_cast<char>(RedisObjectType::String);
         p += sizeof(int8_t);
@@ -125,13 +127,21 @@ public:
         p += sizeof(uint32_t);
 
         memcpy(p, str_view.data(), blob_len);
+        p += blob_len;
+
+        // optional '\0'
+        *p = '\0';
 
         int64_t end = butil::cpuwide_time_us();
         int64_t gap = end - start;
-        if (gap > 500)
-        {
-            LOG(ERROR) << "Serialize cost " << gap;
+
+        if (gap > 500) {
+            LOG(ERROR) << "Vector serialize cost " << gap;
         }
+
+        // 2) copy to std::string (NOT timed)
+        str.append(buf.data(), buf.size());
+
     }
 
     void Deserialize(const char *buf, size_t &offset) override
