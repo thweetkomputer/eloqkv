@@ -105,6 +105,7 @@ public:
         // Because we only store the serialized bytes in kvstore, we need the
         // object type to specify which kind of redis object to create and
         // deserialize it when do read.
+        int64_t start = butil::cpuwide_time_us();
 
         int8_t obj_type_val = static_cast<int8_t>(RedisObjectType::String);
         str.append(sizeof(int8_t), obj_type_val);
@@ -118,6 +119,12 @@ public:
 
         str.append(blob_len_ptr, sizeof(uint32_t));
         str.append(str_view.data(), blob_len);
+        int64_t end = butil::cpuwide_time_us();
+        int64_t gap = end - start;
+        if (gap > 500)
+        {
+            LOG(ERROR) << "Serialize cost " << gap;
+        }
     }
 
     void Deserialize(const char *buf, size_t &offset) override
