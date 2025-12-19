@@ -106,20 +106,26 @@ public:
         // object type to specify which kind of redis object to create and
         // deserialize it when do read.
         int64_t start = butil::cpuwide_time_us();
-        str.reserve(SerializedLength());
 
-        int8_t obj_type_val = static_cast<int8_t>(RedisObjectType::String);
-        str.append(sizeof(int8_t), obj_type_val);
+        const auto str_view = str_obj_.StringView();
+        const uint32_t blob_len = str_view.size();
 
-        std::string_view str_view = str_obj_.StringView();
+        const size_t total =
+            sizeof(int8_t) + sizeof(uint32_t) + blob_len;
 
-        uint32_t blob_len = str_view.size();
+        const size_t old_size = str.size();
+        str.resize(old_size + total);
 
-        const char *blob_len_ptr =
-            static_cast<const char *>(static_cast<const void *>(&blob_len));
+        char* p = str.data() + old_size;
 
-        str.append(blob_len_ptr, sizeof(uint32_t));
-        str.append(str_view.data(), blob_len);
+        *p = static_cast<char>(RedisObjectType::String);
+        p += sizeof(int8_t);
+
+        memcpy(p, &blob_len, sizeof(uint32_t));
+        p += sizeof(uint32_t);
+
+        memcpy(p, str_view.data(), blob_len);
+
         int64_t end = butil::cpuwide_time_us();
         int64_t gap = end - start;
         if (gap > 500)
