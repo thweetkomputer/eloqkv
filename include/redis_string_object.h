@@ -106,6 +106,7 @@ public:
         // object type to specify which kind of redis object to create and
         // deserialize it when do read.
         int64_t start = butil::cpuwide_time_us();
+        str.reserve(SerializedLength());
 
         int8_t obj_type_val = static_cast<int8_t>(RedisObjectType::String);
         str.append(sizeof(int8_t), obj_type_val);
