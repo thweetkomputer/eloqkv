@@ -1,6 +1,9 @@
 #!/bin/bash
 set -exo pipefail
 
+ulimit -n
+ulimit -l
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
@@ -11,7 +14,9 @@ MINIO_ENDPOINT=${1:?usage: $0 minio_endpoint minio_access_key minio_secret_key k
 MINIO_ACCESS_KEY=${2:?usage: $0 minio_endpoint minio_access_key minio_secret_key kv_store_type [git_ssh_key]}
 MINIO_SECRET_KEY=${3:?usage: $0 minio_endpoint minio_access_key minio_secret_key kv_store_type [git_ssh_key]}
 KV_STORE_TYPE=${4:?usage: $0 minio_endpoint minio_access_key minio_secret_key kv_store_type [git_ssh_key]}
+set +x  # don't trace SSH key value
 GIT_SSH_KEY=${5:-}
+set -x
 
 BUILD_TYPE=${BUILD_TYPE:?BUILD_TYPE env var not set}
 CI_MODE=${CI_MODE:-pr}             # "pr" or "main"
@@ -35,10 +40,12 @@ echo "CI_MODE=$CI_MODE BUILD_TYPE=$BUILD_TYPE KV_STORE_TYPE=$KV_STORE_TYPE txlog
 
 # --- SSH key setup (only for PR mode) ---
 if [ -n "$GIT_SSH_KEY" ]; then
+  set +x  # disable trace to avoid leaking SSH key in logs
   mkdir -p ~/.ssh
   echo "$GIT_SSH_KEY" > ~/.ssh/id_rsa
   chmod 600 ~/.ssh/id_rsa
   ssh-keyscan github.com >> ~/.ssh/known_hosts
+  set -x
 fi
 
 # --- Minio env exports ---
