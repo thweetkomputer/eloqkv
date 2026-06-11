@@ -1,5 +1,5 @@
 #!/bin/bash
-set -exo pipefail
+set -Eexo pipefail
 
 ulimit -n
 ulimit -l
@@ -26,6 +26,8 @@ PR_BRANCH_NAME=${PR_BRANCH_NAME:-}
 # All auxiliary repos are cloned alongside it under GITHUB_WORKSPACE/.
 export ELOQKV_BASE_PATH="${GITHUB_WORKSPACE}/eloqkv"
 export ELOQ_TEST_PATH="${GITHUB_WORKSPACE}/eloq_test_src"
+
+trap 'rc=$?; failed_command=$BASH_COMMAND; set +x; dump_ci_failure_logs "$rc" "$failed_command"; exit "$rc"' ERR
 
 # Compute txlog_log_state from kv_store_type (same as pr.ent.bash)
 if [ "$KV_STORE_TYPE" == "ELOQDSS_ROCKSDB_CLOUD_S3" ]; then
