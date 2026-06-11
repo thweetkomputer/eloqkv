@@ -229,16 +229,24 @@ function run_tcl_tests() {
 
 function cleanup_minio_bucket() {
   bucket_name=$1
-  bucket_full_name="eloqkv-${bucket_name}"
-  echo "Clean up bucket ${bucket_name}"
+  if [[ "$bucket_name" == eloqkv-* ]]; then
+    bucket_full_name="${bucket_name}"
+  else
+    bucket_full_name="eloqkv-${bucket_name}"
+  fi
+  echo "Clean up bucket ${bucket_full_name}"
   mc rb --force local/${bucket_full_name} 2>/dev/null || true
 }
 
 function create_minio_bucket()
 {
   bucket_name=$1
-  bucket_full_name="eloqkv-${bucket_name}"
-  echo "Create bucket ${bucket_name}"
+  if [[ "$bucket_name" == eloqkv-* ]]; then
+    bucket_full_name="${bucket_name}"
+  else
+    bucket_full_name="eloqkv-${bucket_name}"
+  fi
+  echo "Create bucket ${bucket_full_name}"
   mc mb local/${bucket_full_name} 2>/dev/null || true
   echo "Minio bucket ${bucket_full_name} has been created."
 }
@@ -2221,10 +2229,6 @@ function run_eloq_test() {
   else
     mkdir ${ELOQ_TEST_PATH}/runtime
   fi
-
-  # generate cassandra keyspace name.
-  local timestamp=$(($(date +%s%N) / 1000000))
-  local keyspace_name="redis_test_${timestamp}"
 
   if [[ $kv_store_type = "ELOQDSS_ROCKSDB_CLOUD_S3" ]]; then
 
