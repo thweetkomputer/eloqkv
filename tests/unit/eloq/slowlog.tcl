@@ -38,13 +38,16 @@ start_server {tags {"slowlog"} overrides {slowlog-log-slower-than 1000000}} {
     } {0}
 
     test {SLOWLOG - logged entry sanity check} {
+        set before [clock seconds]
         r client setname foobar
         r debug sleep 0.2
+        set after [clock seconds]
         set e [lindex [r slowlog get] 0]
         assert_equal [llength $e] 6
         if {!$::external} {
             assert_equal [lindex $e 0] 107
         }
+        assert_equal [expr {[lindex $e 1] >= $before && [lindex $e 1] <= $after}] 1
         assert_equal [expr {[lindex $e 2] > 100000}] 1
         assert_equal [lindex $e 3] {debug sleep 0.2}
         assert_equal {foobar} [lindex $e 5]
@@ -121,6 +124,9 @@ start_server {tags {"slowlog"} overrides {slowlog-log-slower-than 1000000}} {
         assert_equal {incrbyfloat A 1.0} [lindex [lindex [r slowlog get] 0] 3]
 
         # blocked BLPOP is replicated as LPOP
+        # ensure `l` is empty so BLPOP actually blocks (tests share one
+        # external server with no flushall between files)
+        r del l
         set rd [redis_deferring_client]
         $rd blpop l 0
         wait_for_blocked_clients_count 1 50 100

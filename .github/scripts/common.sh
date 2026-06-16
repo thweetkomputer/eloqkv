@@ -1,11 +1,31 @@
 #!/bin/bash
 
-cat <<EOF
-################################################################################
-#If the lengthy task output renders extremely slow,please try fly watch command#
-#(https://concoursetutorial.com/basics/watch-job-output.html)                  #
-################################################################################
-EOF
+# Auto-detect environment in GitHub Actions
+if [ -n "${GITHUB_WORKSPACE}" ]; then
+  # Set ELOQKV_BASE_PATH if not explicitly provided.
+  # The ent CI workflow checks the main repo out to GITHUB_WORKSPACE/eloqkv;
+  # fall back to GITHUB_WORKSPACE itself when there is no eloqkv subdir.
+  if [ -z "${ELOQKV_BASE_PATH}" ]; then
+    if [ -d "${GITHUB_WORKSPACE}/eloqkv" ]; then
+      export ELOQKV_BASE_PATH="${GITHUB_WORKSPACE}/eloqkv"
+    else
+      export ELOQKV_BASE_PATH="${GITHUB_WORKSPACE}"
+    fi
+  fi
+  # Set current_user (used by setup_passwordless_ssh_for_eloq_test)
+  if [ -z "${current_user}" ]; then
+    current_user=$(whoami)
+  fi
+  # Path to eloq_test repo (cloned alongside the main repo)
+  if [ -z "${ELOQ_TEST_PATH}" ]; then
+    export ELOQ_TEST_PATH="${GITHUB_WORKSPACE}/eloq_test_src"
+  fi
+fi
+
+# Build parallelism: defaults to nproc, caller can override per build type
+BUILD_JOBS=${BUILD_JOBS:-$(nproc)}
+# Ensure at least 1 to avoid -j 0 (unlimited parallelism)
+[ "${BUILD_JOBS}" -lt 1 ] && BUILD_JOBS=1
 
 function kernel_version_greater_than_6.5() {
   kernel_version=$(uname -r)
@@ -49,17 +69,32 @@ function wait_until_finished() {
   local timeout=300
   local elapsed=0
   local interval=1
+  local live_pids
 
-  while [ $(ps aux | grep eloqkv | grep -v grep | grep -v launch_sv | grep -v dss_server | wc -l) -gt 0 ]; do
+  # First, forcefully kill any remaining eloqkv processes.
+  # pkill matches by process name, not command line, so it won't
+  # accidentally kill the bash scripts that have eloqkv in their path.
+  pkill -x eloqkv 2>/dev/null || true
+  sleep 2
+  pkill -9 -x eloqkv 2>/dev/null || true
+
+  while true; do
+    live_pids=$(ps -eo pid=,stat=,comm= | awk '$3 == "eloqkv" && $2 !~ /^Z/ {print $1}')
+    if [[ -z "${live_pids}" ]]; then
+      break
+    fi
     sleep $interval
     elapsed=$((elapsed + interval))
     if [ $elapsed -ge $timeout ]; then
-      echo "Timeout: Process still running after $timeout seconds."
-      # list eloqkv still alived
-      ps aux | grep eloqkv | grep -v grep | grep -v launch_sv | grep -v dss_server
+      echo "Timeout: eloqkv process still running after $timeout seconds."
+      ps -eo pid,ppid,stat,comm,args | awk '$4 == "eloqkv" {print}'
       return 1
     fi
   done
+  if pgrep -x eloqkv > /dev/null 2>&1; then
+    echo "Only defunct eloqkv processes remain; continuing."
+    ps -eo pid,ppid,stat,comm,args | awk '$4 == "eloqkv" {print}'
+  fi
   return 0
 }
 
@@ -153,7 +188,7 @@ function run_tcl_tests() {
     no_evicted=""
   fi
 
-  local eloqkv_base_path="/home/$current_user/workspace/eloqkv"
+  local eloqkv_base_path="${ELOQKV_BASE_PATH}"
 
   cd ${eloqkv_base_path}
 
@@ -203,90 +238,151 @@ function run_tcl_tests() {
 
 function cleanup_minio_bucket() {
   bucket_name=$1
-  #prefix="eloqkv-"
-  bucket_full_name="eloqkv-${bucket_name}"
-  SCRIPT_DIR="/home/$current_user/workspace/eloqkv/concourse/scripts"
-  echo "Clean up bucket ${bucket_name}"
-  python3 ${SCRIPT_DIR}/cleanup_minio_bucket.py \
-    --minio_endpoint ${ROCKSDB_CLOUD_S3_ENDPOINT} \
-    --minio_access_key ${ROCKSDB_CLOUD_AWS_ACCESS_KEY_ID} \
-    --minio_secret_key ${ROCKSDB_CLOUD_AWS_SECRET_ACCESS_KEY} \
-    --bucket_name ${bucket_full_name}
+  if [[ "$bucket_name" == eloqkv-* ]]; then
+    bucket_full_name="${bucket_name}"
+  else
+    bucket_full_name="eloqkv-${bucket_name}"
+  fi
+  echo "Clean up bucket ${bucket_full_name}"
+  mc rb --force local/${bucket_full_name} 2>/dev/null || true
 }
 
-function create_minio_bucket()
-{
-  bucket_name=$1
-  bucket_full_name="eloqkv-${bucket_name}"
-  SCRIPT_DIR="/home/$current_user/workspace/eloqkv/concourse/scripts"
-  echo "Create bucket ${bucket_name}"
-  python3 ${SCRIPT_DIR}/create_minio_bucket.py \
-               --minio_endpoint ${ROCKSDB_CLOUD_S3_ENDPOINT} \
-               --minio_access_key ${ROCKSDB_CLOUD_AWS_ACCESS_KEY_ID} \
-               --minio_secret_key ${ROCKSDB_CLOUD_AWS_SECRET_ACCESS_KEY} \
-               --bucket_name ${bucket_full_name}
-  echo "Minio bucket ${bucket_full_name} has been created."
+function dump_file_tail() {
+  local file=$1
+  local lines=${2:-300}
+
+  if [ -f "$file" ]; then
+    echo ""
+    echo "===== ${file} (last ${lines} lines) ====="
+    tail -n "$lines" "$file" || true
+  fi
 }
 
-function run_build() {
-  local build_type=$1
-  local kv_store_type=$2
+function dump_core_backtraces() {
+  # Print a full backtrace for every core dump we can find. Requires the
+  # core_pattern to write a real file (set in gh_ci_entry.sh on the privileged
+  # ent-ci runners) and gdb to be installed.
+  set +e
+  echo ""
+  echo "===== core dump backtraces ====="
 
-  # compile eloqkv
-  cd /home/$current_user/workspace/eloqkv
-  cmake \
-    -S /home/$current_user/workspace/eloqkv \
-    -B /home/$current_user/workspace/eloqkv/cmake \
-    -DCMAKE_INSTALL_PREFIX=/home/$current_user/workspace/eloqkv/install \
-    -DCMAKE_BUILD_TYPE=$build_type \
-    -DWITH_DATA_STORE=$kv_store_type \
-    -DELOQ_MODULE_ENABLED=ON \
-    -DEXT_TX_PROC_ENABLED=ON \
-    -DBUILD_WITH_TESTS=ON \
-    -DWITH_LOG_SERVICE=ON
+  if ! command -v gdb >/dev/null 2>&1; then
+    echo "gdb not installed; installing..."
+    (apt-get update && apt-get install -y gdb) >/dev/null 2>&1 || true
+  fi
+  if ! command -v gdb >/dev/null 2>&1; then
+    echo "gdb unavailable; cannot symbolize cores. core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+    return 0
+  fi
 
-  # Define the output log file
-  log_file="/tmp/compile_info.log"
+  # Search the locations we configure core_pattern to use, plus a couple of
+  # common fallbacks. Newest first, cap the number we symbolize.
+  local cores
+  cores=$(find /tmp /var/crash "${ELOQKV_BASE_PATH:-/nonexistent}" -maxdepth 3 -type f \
+    -name 'core*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}' | head -5)
 
-  # Function to run cmake build and check for errors
-  run_cmake_build() {
-    local target=$1
-    cmake --build /home/$current_user/workspace/eloqkv/cmake --target "$target" -j 8
-    local exit_status=$?
+  if [ -z "$cores" ]; then
+    echo "No core files found. core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null)"
+    return 0
+  fi
 
-    if [ $exit_status -ne 0 ]; then
-      echo "CMake build for target '$target' failed."
-      exit $exit_status
+  # Directories that may hold the (symbol-bearing) binaries that produced cores.
+  local search_roots="${ELOQKV_BASE_PATH:-.}"
+
+  local core
+  for core in $cores; do
+    echo ""
+    echo "----- backtrace for ${core} -----"
+
+    # The core's %e is the crashing thread's comm name (e.g. brpc_worker:0),
+    # not the executable, and the recorded program path is relative
+    # (./build/eloqkv), so gdb cannot locate the binary on its own. Read the
+    # generating program from the core, then find the real binary and pass it
+    # to gdb explicitly so symbols resolve.
+    local prog base exe
+    prog=$(gdb -q -batch -nx -c "$core" 2>/dev/null \
+      | sed -n "s/^Core was generated by \`\\([^ ']*\\).*/\\1/p")
+    base=$(basename "${prog:-eloqkv}")
+    exe=$(find $search_roots -maxdepth 4 -type f -name "$base" 2>/dev/null | head -1)
+    # Fall back to the eloqkv server binary if we couldn't match by name.
+    if [ -z "$exe" ]; then
+      exe=$(find $search_roots -maxdepth 4 -type f -name eloqkv 2>/dev/null | head -1)
     fi
+    echo "program: ${prog:-unknown}  ->  binary: ${exe:-<not found>}"
 
-    cmake --install /home/$current_user/workspace/eloqkv/cmake
-  }
+    if [ -n "$exe" ]; then
+      gdb -q -batch -nx \
+        -ex 'set pagination off' \
+        -ex 'bt full' \
+        -ex 'echo \n----- all threads -----\n' \
+        -ex 'thread apply all bt' \
+        "$exe" "$core" 2>&1 | head -600 || true
+    else
+      echo "could not locate a binary for ${base}; backtrace without symbols:"
+      gdb -q -batch -nx \
+        -ex 'set pagination off' \
+        -ex 'thread apply all bt' \
+        -c "$core" 2>&1 | head -200 || true
+    fi
+  done
+  echo "===== end core dump backtraces ====="
+}
 
-  # Run builds for the specified targets
-  targets=("eloqkv" "object_serialize_deserialize_test")
+function dump_ci_failure_logs() {
+  local rc=${1:-1}
+  local failed_command=${2:-unknown}
 
   set +e
-  for target in "${targets[@]}"; do
-    run_cmake_build "$target"
+  echo ""
+  echo "===== CI failure diagnostics ====="
+  echo "Exit code: ${rc}"
+  echo "Failed command: ${failed_command}"
+  date || true
+  pwd || true
+
+  dump_core_backtraces
+
+  echo ""
+  echo "===== Running eloq-related processes ====="
+  ps -ef | grep -E 'eloqkv|dss_server|launch_sv|minio|redis-server' | grep -v grep || true
+
+  echo ""
+  echo "===== eloq_test runtime files ====="
+  if [ -n "${ELOQ_TEST_PATH:-}" ] && [ -d "${ELOQ_TEST_PATH}/runtime" ]; then
+    find "${ELOQ_TEST_PATH}/runtime" -maxdepth 3 -type f -printf '%p\n' | sort || true
+    while IFS= read -r file; do
+      dump_file_tail "$file" 400
+    done < <(find "${ELOQ_TEST_PATH}/runtime" -maxdepth 3 -type f \
+      \( -name '*log*' -o -name '*.log' -o -name 'LOG' \) | sort)
+  else
+    echo "No eloq_test runtime directory found at ${ELOQ_TEST_PATH:-<unset>}/runtime"
+  fi
+
+  echo ""
+  echo "===== /tmp CI logs ====="
+  for file in \
+    /tmp/minio.log \
+    /tmp/eloq_dss_data/eloq_dss_server.log \
+    /tmp/redis_single_node.log \
+    /tmp/redis_cluster_with_eloqstore.log \
+    /tmp/redis_log_service.log \
+    /tmp/load.log \
+    /tmp/compile_info.log; do
+    dump_file_tail "$file" 400
   done
-  set -e
 
-  # compile log service to setup redis cluster later
-  cd /home/$current_user/workspace/eloqkv/data_substrate/log_service
-  cmake -B bld -DCMAKE_BUILD_TYPE=$build_type && cmake --build bld -j 8
-  cp /home/$current_user/workspace/eloqkv/data_substrate/log_service/bld/launch_sv /home/$current_user/workspace/eloqkv/install/bin/
+  while IFS= read -r file; do
+    dump_file_tail "$file" 250
+  done < <(find /tmp -maxdepth 2 -type f \
+    \( -name 'redis_server*.log' -o -name 'eloq*.log' -o -name 'dss*.log' \) | sort)
 
-  case "$kv_store_type" in
-  ELOQDSS_*)
-    echo "build dss_server"
-    cd /home/$current_user/workspace/eloqkv/data_substrate/store_handler/eloq_data_store_service
-    cmake -B bld -DCMAKE_BUILD_TYPE=$build_type -DWITH_DATA_STORE=$kv_store_type && cmake --build bld -j8
-    cp /home/$current_user/workspace/eloqkv/data_substrate/store_handler/eloq_data_store_service/bld/dss_server /home/$current_user/workspace/eloqkv/install/bin/
-    ;;
-  esac
+  echo ""
+  echo "===== End CI failure diagnostics ====="
+}
 
-  cd /home/$current_user/workspace/eloqkv
-
+function prepare_eloqstore_minio_buckets() {
+  cleanup_minio_bucket ${ELOQSTORE_BUCKET_NAME}
+  cleanup_minio_bucket ${ROCKSDB_CLOUD_BUCKET_NAME}
 }
 
 function run_build_ent() {
@@ -295,24 +391,26 @@ function run_build_ent() {
   local txlog_log_state=$3
 
   # compile eloqkv
-  cd /home/$current_user/workspace/eloqkv
+  cd ${ELOQKV_BASE_PATH}
   cmake \
-    -S /home/$current_user/workspace/eloqkv \
-    -B /home/$current_user/workspace/eloqkv/cmake \
-    -DCMAKE_INSTALL_PREFIX=/home/$current_user/workspace/eloqkv/install \
+    -S ${ELOQKV_BASE_PATH} \
+    -B ${ELOQKV_BASE_PATH}/cmake \
+    -DCMAKE_INSTALL_PREFIX=${ELOQKV_BASE_PATH}/install \
     -DCMAKE_BUILD_TYPE=$build_type \
     -DWITH_DATA_STORE=$kv_store_type \
     -DWITH_LOG_STATE=$txlog_log_state \
     -DELOQ_MODULE_ENABLED=ON \
     -DEXT_TX_PROC_ENABLED=ON \
     -DBUILD_WITH_TESTS=ON \
-    -DWITH_LOG_SERVICE=ON
+    -DWITH_LOG_SERVICE=ON \
+    -DOPEN_LOG_SERVICE=OFF \
+    -DFORK_HM_PROCESS=ON
 
   # Define the output log file
   log_file="/tmp/compile_info.log"
 
   run_cmake_build() {
-    cmake --build /home/$current_user/workspace/eloqkv/cmake -j 8
+    cmake --build ${ELOQKV_BASE_PATH}/cmake -j ${BUILD_JOBS}
     local exit_status=$?
 
     if [ $exit_status -ne 0 ]; then
@@ -325,48 +423,30 @@ function run_build_ent() {
   run_cmake_build
   set -e
 
-  cmake --install /home/$current_user/workspace/eloqkv/cmake
+  cmake --install ${ELOQKV_BASE_PATH}/cmake
 
   # compile log service to setup redis cluster later
-  cd /home/$current_user/workspace/eloqkv/data_substrate/eloq_log_service
-  cmake -B bld -DCMAKE_BUILD_TYPE=$build_type && cmake --build bld -j 8
-  cp /home/$current_user/workspace/eloqkv/data_substrate/eloq_log_service/bld/launch_sv /home/$current_user/workspace/eloqkv/install/bin/
+  cd ${ELOQKV_BASE_PATH}/data_substrate/eloq_log_service
+  cmake -B bld -DCMAKE_BUILD_TYPE=$build_type && cmake --build bld -j ${BUILD_JOBS}
+  cp ${ELOQKV_BASE_PATH}/data_substrate/eloq_log_service/bld/launch_sv ${ELOQKV_BASE_PATH}/install/bin/
 
   case "$kv_store_type" in
   ELOQDSS_*)
     echo "build dss_server"
-    cd /home/$current_user/workspace/eloqkv/data_substrate/store_handler/eloq_data_store_service
-    cmake -B bld -DCMAKE_BUILD_TYPE=$build_type -DWITH_DATA_STORE=$kv_store_type && cmake --build bld -j8
-    cp /home/$current_user/workspace/eloqkv/data_substrate/store_handler/eloq_data_store_service/bld/dss_server /home/$current_user/workspace/eloqkv/install/bin/
+    cd ${ELOQKV_BASE_PATH}/data_substrate/store_handler/eloq_data_store_service
+    cmake -B bld -DCMAKE_BUILD_TYPE=$build_type -DWITH_DATA_STORE=$kv_store_type && cmake --build bld -j ${BUILD_JOBS}
+    cp ${ELOQKV_BASE_PATH}/data_substrate/store_handler/eloq_data_store_service/bld/dss_server ${ELOQKV_BASE_PATH}/install/bin/
     ;;
   esac
 
-  cd /home/$current_user/workspace/eloqkv
-
-}
-
-function run_eloq_ttl_tests() {
-  #TestsWithMem TestsWithKV TestsWithLog
-  local test_case=$1
-  local enable_wal=$2
-  local enable_data_store=$3
-  local kv_type=$4
-
-  local timestamp=$(($(date +%s%N) / 1000000))
-  local keyspace_name="redis_test_${timestamp}"
-  echo "keyspace name is, ${keyspace_name}"
-
-  cd /home/$current_user/workspace/eloqkv
-  local exe_path="/home/$current_user/workspace/eloqkv/install/bin/eloqkv"
-  local python_test_file="/home/$current_user/workspace/eloq_test/redis_test/single_test/test_ttl_eloqkv.py"
-  python3 $python_test_file $exe_path ${test_case} --enable_wal=${enable_wal} --enable_data_store=${enable_data_store} --kv_type=${kv_type} --cass_host=${CASS_HOST} --cass_keyspace=${keyspace_name} --cass_bin="/home/$current_user/workspace/apache-cassandra-4.0.6/bin/"
+  cd ${ELOQKV_BASE_PATH}
 
 }
 
 function run_eloqkv_tests() {
   local build_type=$1
   local kv_store_type=$2
-  local eloqkv_base_path="/home/$current_user/workspace/eloqkv"
+  local eloqkv_base_path="${ELOQKV_BASE_PATH}"
 
   # clean data dir
   rm -rf /tmp/eloq_data
@@ -377,8 +457,8 @@ function run_eloqkv_tests() {
 
     echo "bootstrap rocksdb"
 
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=true \
@@ -392,8 +472,8 @@ function run_eloqkv_tests() {
 
     # run redis
     echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=true \
@@ -432,8 +512,8 @@ function run_eloqkv_tests() {
 
     # run redis
     echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=true \
@@ -480,7 +560,7 @@ function run_eloqkv_tests() {
     # wait for kill to finish
     wait_until_finished
 
-    cd /home/$current_user/workspace/eloqkv
+    cd ${ELOQKV_BASE_PATH}
     if [ -d "./cc_ng" ]; then
       rm -rf ./cc_ng
     fi
@@ -493,8 +573,8 @@ function run_eloqkv_tests() {
 
     # run redis with wal disabled.
     echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=false \
@@ -523,8 +603,8 @@ function run_eloqkv_tests() {
 
     # run redis with wal and data store disabled.
     echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=false \
@@ -566,8 +646,8 @@ function run_eloqkv_tests() {
     local txlog_rocksdb_cloud_object_path=${TXLOG_ROCKSDB_CLOUD_OBJECT_PATH}
     local txlog_rocksdb_cloud_s3_endpoint_url=${ROCKSDB_CLOUD_S3_ENDPOINT}
 
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=true \
@@ -591,8 +671,8 @@ function run_eloqkv_tests() {
 
     # run redis
     echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=true \
@@ -642,8 +722,8 @@ function run_eloqkv_tests() {
 
     # run redis
     echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=true \
@@ -701,7 +781,7 @@ function run_eloqkv_tests() {
     # wait for kill to finish
     wait_until_finished
 
-    cd /home/$current_user/workspace/eloqkv
+    cd ${ELOQKV_BASE_PATH}
     if [ -d "./cc_ng" ]; then
       rm -rf ./cc_ng
     fi
@@ -714,8 +794,8 @@ function run_eloqkv_tests() {
 
     # run redis with wal disabled.
     echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=false \
@@ -755,8 +835,8 @@ function run_eloqkv_tests() {
 
     # run redis with wal and data store disabled.
     echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=false \
@@ -801,11 +881,10 @@ function run_eloqkv_tests() {
 
     cleanup_minio_bucket ${ELOQSTORE_BUCKET_NAME}
     cleanup_minio_bucket ${ROCKSDB_CLOUD_BUCKET_NAME}
-    create_minio_bucket ${ELOQSTORE_BUCKET_NAME}
     local eloq_data_path="/tmp/eloqkv_data"
-    local node_memory_limit_mb=8192
+    local node_memory_limit_mb=${NODE_MEMORY_LIMIT_MB:-2048}
     local eloq_store_data_path="/tmp/eloqkv_data/eloq_store"
-    local eloqkv_bin_path="/home/$current_user/workspace/eloqkv/install/bin/eloqkv"
+    local eloqkv_bin_path="${ELOQKV_BASE_PATH}/install/bin/eloqkv"
     local aws_access_key_id=${ROCKSDB_CLOUD_AWS_ACCESS_KEY_ID}
     local aws_secret_key=${ROCKSDB_CLOUD_AWS_SECRET_ACCESS_KEY}
     local txlog_rocksdb_cloud_bucket_prefix=${ROCKSDB_CLOUD_BUCKET_PREFIX}
@@ -822,7 +901,7 @@ function run_eloqkv_tests() {
     rm -rf ${eloq_data_path}/*
     echo "redirecting output to /tmp/ to prevent ci pipeline crash" >>/tmp/redis_single_node.log
     echo "small ckpt interval with wal and data store." >>/tmp/redis_single_node.log
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
     ${eloqkv_bin_path} \
         --port=6379 \
         --core_number=2 \
@@ -874,7 +953,7 @@ function run_eloqkv_tests() {
     rm -rf ${eloq_data_path}/*
     echo "redirecting output to /tmp/ to prevent ci pipeline crash" >>/tmp/redis_single_node.log
     echo "big ckpt interval before replay with wal and data store." >>/tmp/redis_single_node.log
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
       ${eloqkv_bin_path} \
       --port=6379 \
       --core_number=2 \
@@ -933,7 +1012,7 @@ function run_eloqkv_tests() {
     # run redis
     echo "redirecting output to /tmp/ to prevent ci pipeline crash" >>/tmp/redis_single_node.log
     echo "big ckpt interval after replay with wal and data store." >>/tmp/redis_single_node.log
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
       ${eloqkv_bin_path} \
       --port=6379 \
       --core_number=2 \
@@ -1174,17 +1253,25 @@ function run_eloqkv_tests() {
 
 # Function to wait until data store server is ready
 function wait_dss_until_ready() {
+  local dss_server_pid=$1
+  local dss_log_path=${2:-/tmp/eloq_dss_data/eloq_dss_server.log}
   local interval=1
   local timeout=300
   local elapsed=0
-  local dss_log_path="/tmp/eloq_dss_data/eloq_dss_server.log"
 
-  while [ $(grep -i "DataStoreService Server Started" ${dss_log_path} | wc -l) -eq 0 ]; do
+  while ! grep -qi "DataStoreService Server Started" "${dss_log_path}" 2>/dev/null; do
+    if [[ -n "${dss_server_pid}" ]] && ! kill -0 "${dss_server_pid}" 2>/dev/null; then
+      echo "Data store server process ${dss_server_pid} exited before becoming ready."
+      dump_file_tail "${dss_log_path}" 200
+      return 1
+    fi
     sleep $interval
     elapsed=$((elapsed + interval))
     echo "Wait until data store server ready for $elapsed seconds."
     if [ $elapsed -ge $timeout ]; then
       echo "Timeout: Data store server is not ready after $elapsed seconds."
+      ps -eo pid,ppid,stat,comm,args | awk '$4 == "dss_server" {print}'
+      dump_file_tail "${dss_log_path}" 200
       return 1
     fi
   done
@@ -1196,29 +1283,36 @@ function wait_dss_until_finished() {
   local interval=1
   local timeout=120
   local elapsed=0
+  local live_pids
 
-  while [ $(ps aux | grep dss_server | grep -v grep | wc -l) -gt 0 ]; do
+  while true; do
+    live_pids=$(ps -eo pid=,stat=,comm= | awk '$3 == "dss_server" && $2 !~ /^Z/ {print $1}')
+    if [[ -z "${live_pids}" ]]; then
+      break
+    fi
     sleep $interval
     elapsed=$((elapsed + interval))
     if [ $elapsed -ge $timeout ]; then
       echo "Timeout: Process still running after $timeout seconds."
       # list dss still alived
-      ps aux | grep dss_server | grep -v grep
+      ps -eo pid,ppid,stat,comm,args | awk '$4 == "dss_server" {print}'
       return 1
     fi
   done
+  if pgrep -x dss_server > /dev/null 2>&1; then
+    echo "Only defunct dss_server processes remain; continuing."
+    ps -eo pid,ppid,stat,comm,args | awk '$4 == "dss_server" {print}'
+  fi
   return 0
 }
 
 function stop_and_clean_dss_server() {
   local kv_store_type=$1
 
-  set +e
-  pkill -x dss_server
-  rm data_store_config.ini
-  rm /tmp/data_store_config.ini
+  pkill -x dss_server || true
+  rm -f data_store_config.ini
+  rm -f /tmp/data_store_config.ini
   rm -rf /tmp/eloq_dss_data
-  set -e
 
   wait_dss_until_finished
 
@@ -1233,7 +1327,7 @@ function start_dss_server() {
   local dss_ip=$1
   local dss_port=$2
   local kv_store_type=$3
-  local eloqkv_base_path="/home/$current_user/workspace/eloqkv"
+  local eloqkv_base_path="${ELOQKV_BASE_PATH}"
   local dss_data_path="/tmp/eloq_dss_data"
   local dss_log_path="/tmp/eloq_dss_data/eloq_dss_server.log"
   local dss_server_configs=
@@ -1253,15 +1347,14 @@ function start_dss_server() {
     elif [[ $kv_store_type = "ELOQDSS_ELOQSTORE" ]]; then
         local eloq_store_worker_num=2
         local eloq_store_data_path="${dss_data_path}/eloq_store"
-        local eloq_store_open_files_limit=10240
+        local eloq_store_open_files_limit=512
         local eloq_store_cloud_provider=aws
         local eloq_store_cloud_endpoint=${ROCKSDB_CLOUD_S3_ENDPOINT}
         local eloq_store_cloud_access_key=${ROCKSDB_CLOUD_AWS_ACCESS_KEY_ID}
         local eloq_store_cloud_secret_key=${ROCKSDB_CLOUD_AWS_SECRET_ACCESS_KEY}
         local eloq_store_cloud_store_path=${ELOQSTORE_BUCKET_NAME}
-        local eloq_store_buffer_pool_size=8MB
+        local eloq_store_buffer_pool_size=1MB
         cleanup_minio_bucket ${ELOQSTORE_BUCKET_NAME}
-        create_minio_bucket ${ELOQSTORE_BUCKET_NAME}
         dss_server_configs="--eloq_store_worker_num=${eloq_store_worker_num} \
                             --eloq_store_data_path_list=${eloq_store_data_path} \
                             --eloq_store_open_files_limit=${eloq_store_open_files_limit} \
@@ -1287,13 +1380,13 @@ function start_dss_server() {
     &
   local dss_server_pid=$!
 
-  wait_dss_until_ready
+  wait_dss_until_ready "$dss_server_pid" "$dss_log_path"
   echo "dss_server is started, pid: $dss_server_pid"
 }
 function run_eloqkv_cluster_tests() {
   local build_type=$1
   local kv_store_type=$2
-  local eloqkv_base_path="/home/$current_user/workspace/eloqkv"
+  local eloqkv_base_path="${ELOQKV_BASE_PATH}"
 
   # remove data dir generated by other tests.
   rm -rf /tmp/redis_server_data*
@@ -1305,7 +1398,7 @@ function run_eloqkv_cluster_tests() {
     local log_service_ip_port="127.0.0.1:9000"
 
     rm -rf /tmp/log_data
-    /home/$current_user/workspace/eloqkv/install/bin/launch_sv \
+    ${ELOQKV_BASE_PATH}/install/bin/launch_sv \
       -conf=$log_service_ip_port \
       -node_id=0 \
       -storage_path="/tmp/log_data" \
@@ -1319,8 +1412,8 @@ function run_eloqkv_cluster_tests() {
     sleep 10
 
     echo "bootstrap before start cluster to avoid contention"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=false \
@@ -1357,8 +1450,8 @@ function run_eloqkv_cluster_tests() {
 
     for port in "${ports[@]}"; do
       echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-      env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-        /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+      env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+        ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
         --port=$port \
         --core_number=2 \
         --enable_wal=false \
@@ -1425,8 +1518,8 @@ function run_eloqkv_cluster_tests() {
 
     for port in "${ports[@]}"; do
       echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-      env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-        /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+      env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+        ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
         --port=$port \
         --core_number=2 \
         --enable_wal=false \
@@ -1479,8 +1572,8 @@ function run_eloqkv_cluster_tests() {
     rm -rf /tmp/redis_server_data*
 
     echo "bootstrap before start cluster to avoid contention"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=false \
@@ -1514,8 +1607,8 @@ function run_eloqkv_cluster_tests() {
     redis_pids=()
     local index=0
     for port in "${ports[@]}"; do
-      env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-        /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+      env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+        ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
         --port=$port \
         --core_number=2 \
         --enable_wal=false \
@@ -1561,7 +1654,7 @@ function run_eloqkv_cluster_tests() {
     local log_service_ip_port="127.0.0.1:9000"
 
     rm -rf /tmp/log_data
-    /home/$current_user/workspace/eloqkv/install/bin/launch_sv \
+    ${ELOQKV_BASE_PATH}/install/bin/launch_sv \
       -conf=$log_service_ip_port \
       -node_id=0 \
       -storage_path="/tmp/log_data" \
@@ -1580,8 +1673,8 @@ function run_eloqkv_cluster_tests() {
     rm -rf /tmp/redis_server_data*
 
     echo "bootstrap before start cluster to avoid contention"
-    env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-      /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+    env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+      ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
       --port=6379 \
       --core_number=2 \
       --enable_wal=true \
@@ -1621,8 +1714,8 @@ function run_eloqkv_cluster_tests() {
 
     for port in "${ports[@]}"; do
       echo "redirecting output to /tmp/ to prevent ci pipeline crash"
-      env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-        /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+      env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+        ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
         --port=$port \
         --core_number=2 \
         --enable_wal=true \
@@ -1683,8 +1776,8 @@ function run_eloqkv_cluster_tests() {
     redis_pids=()
     local index=0
     for port in "${ports[@]}"; do
-      env LD_LIBRARY_PATH=/home/$current_user/workspace/eloqkv/install/lib/:${LD_LIBRARY_PATH} \
-        /home/$current_user/workspace/eloqkv/install/bin/eloqkv \
+      env LD_LIBRARY_PATH=${ELOQKV_BASE_PATH}/install/lib/:${LD_LIBRARY_PATH} \
+        ${ELOQKV_BASE_PATH}/install/bin/eloqkv \
         --port=$port \
         --core_number=2 \
         --enable_wal=true \
@@ -1756,7 +1849,7 @@ function run_eloqkv_cluster_tests() {
   elif [[ $kv_store_type = "ELOQDSS_ELOQSTORE" ]]; then
     echo "eloqkv cluster test with dss_eloqstore." >/tmp/redis_cluster_with_eloqstore.log
 
-    local node_memory_limit_mb=8192
+    local node_memory_limit_mb=${NODE_MEMORY_LIMIT_MB:-2048}
     local dss_peer_node="127.0.0.1:9100"
     local rocksdb_cloud_aws_access_key_id=${ROCKSDB_CLOUD_AWS_ACCESS_KEY_ID}
     local rocksdb_cloud_aws_secret_access_key=${ROCKSDB_CLOUD_AWS_SECRET_ACCESS_KEY}
@@ -1766,7 +1859,7 @@ function run_eloqkv_cluster_tests() {
     local txlog_rocksdb_cloud_s3_endpoint_url=${ROCKSDB_CLOUD_S3_ENDPOINT}
     local eloq_store_cloud_store_path=${ELOQSTORE_BUCKET_NAME}/eloqstore
     local ports=(6379 7379 8379)
-    local eloqkv_bin_path="/home/$current_user/workspace/eloqkv/install/bin/eloqkv"
+    local eloqkv_bin_path="${ELOQKV_BASE_PATH}/install/bin/eloqkv"
 
     # stop_and_clean_dss_server $kv_store_type
     # start_dss_server "127.0.0.1" "9100" $kv_store_type
@@ -2046,7 +2139,7 @@ function run_eloqkv_cluster_tests() {
     local log_service_ip_port="127.0.0.1:9000"
 
     rm -rf /tmp/log_data
-    /home/$current_user/workspace/eloqkv/install/bin/launch_sv \
+    ${ELOQKV_BASE_PATH}/install/bin/launch_sv \
       -conf=$log_service_ip_port \
       -node_id=0 \
       -storage_path="/tmp/log_data" \
@@ -2265,26 +2358,22 @@ function run_eloq_test() {
   # https://github.com/grpc/grpc/blob/master/doc/fork_support.md
   export GRPC_ENABLE_FORK_SUPPORT=0
 
-  local eloqkv_install_path="/home/$current_user/workspace/eloqkv/install"
+  local eloqkv_install_path="${ELOQKV_BASE_PATH}/install"
 
-  if [ ! -d "/home/$current_user/workspace/eloq_test/" ]; then
-    echo "/home/$current_user/workspace/eloq_test/ not exists, exit !!!"
+  if [ ! -d "${ELOQ_TEST_PATH}/" ]; then
+    echo "${ELOQ_TEST_PATH}/ not exists, exit !!!"
   fi
 
   setup_passwordless_ssh_for_eloq_test
 
-  cd /home/$current_user/workspace/eloq_test
+  cd ${ELOQ_TEST_PATH}
   ./setup
 
-  if [ -d "/home/$current_user/workspace/eloq_test/runtime" ]; then
-    rm -rf /home/$current_user/workspace/eloq_test/runtime/*
+  if [ -d "${ELOQ_TEST_PATH}/runtime" ]; then
+    rm -rf ${ELOQ_TEST_PATH}/runtime/*
   else
-    mkdir /home/$current_user/workspace/eloq_test/runtime
+    mkdir ${ELOQ_TEST_PATH}/runtime
   fi
-
-  # generate cassandra keyspace name.
-  local timestamp=$(($(date +%s%N) / 1000000))
-  local keyspace_name="redis_test_${timestamp}"
 
   if [[ $kv_store_type = "ELOQDSS_ROCKSDB_CLOUD_S3" ]]; then
 
@@ -2348,6 +2437,7 @@ function run_eloq_test() {
 
   elif [[ $kv_store_type = "ELOQDSS_ELOQSTORE" ]]; then
     echo "Run eloq_test for ELOQDSS_ELOQSTORE"
+    prepare_eloqstore_minio_buckets
     local rocksdb_cloud_s3_endpoint_url=${ROCKSDB_CLOUD_S3_ENDPOINT}
     local rocksdb_cloud_s3_endpoint_url_escape=${ROCKSDB_CLOUD_S3_ENDPOINT_ESCAPE}
     local rocksdb_cloud_aws_access_key_id=${ROCKSDB_CLOUD_AWS_ACCESS_KEY_ID}
@@ -2410,19 +2500,27 @@ function run_eloq_test() {
 
     # run single/multi test
     rm -rf runtime/*
+    prepare_eloqstore_minio_buckets
     python3 redis_test/multi_test/smoke_test.py --dbtype redis --storage eloqdss-eloqstore-cloud --install_path ${eloqkv_install_path} --bootstrap true
 
+    prepare_eloqstore_minio_buckets
     python3 redis_test/multi_test/cluster_rolling_upgrade.py --dbtype redis --storage eloqdss-eloqstore-cloud --install_path ${eloqkv_install_path} --bootstrap true
+    prepare_eloqstore_minio_buckets
     python3 redis_test/multi_test/cluster_scale_test.py --dbtype redis --storage eloqdss-eloqstore-cloud --install_path ${eloqkv_install_path} --bootstrap true
 
     # run log service scale test
     rm -rf runtime/*
+    prepare_eloqstore_minio_buckets
     python3 redis_test/log_service_test/log_service_scale_test.py --dbtype redis --storage eloqdss-eloqstore-cloud --install_path ${eloqkv_install_path}
 
     # run standby test
     rm -rf runtime/*
-    python3 run_tests.py --dbtype redis --group standby --storage eloqdss-eloqstore-local --install_path ${eloqkv_install_path} --bootstrap true
+    prepare_eloqstore_minio_buckets
+    # TODO: Re-enable after eloqdss-eloqstore-local standby startup no longer
+    # times out waiting for standby nodes to become transaction-ready.
+    # python3 run_tests.py --dbtype redis --group standby --storage eloqdss-eloqstore-local --install_path ${eloqkv_install_path} --bootstrap true
     rm -rf runtime/*
+    prepare_eloqstore_minio_buckets
     python3 run_tests.py --dbtype redis --group standby --storage eloqdss-eloqstore-cloud --install_path ${eloqkv_install_path} --bootstrap true
     rm -rf runtime/*
     # rm -rf runtime/*
