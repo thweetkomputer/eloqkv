@@ -46,10 +46,6 @@ jobs:
       TAGGED: ${{ inputs.tag_name }}
 
     steps:
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-
       - uses: actions/checkout@v4
         with:
           submodules: recursive
