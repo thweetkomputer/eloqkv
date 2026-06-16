@@ -60,13 +60,13 @@ jobs:
           case "${{ inputs.package_manager }}" in
             apt)
               apt-get update -qq
-              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-client rsync patchelf
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-client rsync patchelf libjemalloc-dev
               ;;
             dnf)
-              dnf install -y postgresql-devel rsync patchelf
+              dnf install -y postgresql-devel rsync patchelf jemalloc-devel
               ;;
             yum)
-              yum install -y postgresql-devel rsync patchelf
+              yum install -y postgresql-devel rsync patchelf jemalloc-devel
               ;;
           esac
 

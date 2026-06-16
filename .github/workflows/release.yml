@@ -35,26 +35,7 @@ jobs:
       matrix:
         include:
           # ---- ubuntu24.04 only ----
-          - os_id: ubuntu24
-            container: eloqdata/eloq-dev-ci-ubuntu2404:latest
-            pkg: apt
-            data_store_type: ROCKSDB
-            log_state_type: ROCKSDB
-            data_store_id: rocksdb
-            build_dss: false
-            build_rocksdb_tools: true
-            cmake_extra: ''
-
-          - os_id: ubuntu24
-            container: eloqdata/eloq-dev-ci-ubuntu2404:latest
-            pkg: apt
-            data_store_type: ELOQDSS_ROCKSDB_CLOUD_S3
-            log_state_type: ROCKSDB_CLOUD_S3
-            data_store_id: rocks_s3
-            build_dss: true
-            build_rocksdb_tools: true
-            cmake_extra: '-DWITH_CLOUD_AZ_INFO=ON'
-
+          # eloqstore-local built with jemalloc for memory analysis
           - os_id: ubuntu24
             container: eloqdata/eloq-dev-ci-ubuntu2404:latest
             pkg: apt
@@ -63,24 +44,4 @@ jobs:
             data_store_id: eloqstore_local
             build_dss: true
             build_rocksdb_tools: false
-            cmake_extra: ''
-
-          - os_id: ubuntu24
-            container: eloqdata/eloq-dev-ci-ubuntu2404:latest
-            pkg: apt
-            data_store_type: ELOQDSS_ELOQSTORE
-            log_state_type: ROCKSDB_CLOUD_S3
-            data_store_id: eloqstore_s3
-            build_dss: true
-            build_rocksdb_tools: false
-            cmake_extra: ''
-
-          - os_id: ubuntu24
-            container: eloqdata/eloq-dev-ci-ubuntu2404:latest
-            pkg: apt
-            data_store_type: ELOQDSS_ELOQSTORE
-            log_state_type: ROCKSDB_CLOUD_GCS
-            data_store_id: eloqstore_gcs
-            build_dss: true
-            build_rocksdb_tools: false
-            cmake_extra: ''
+            cmake_extra: '-DWITH_JEMALLOC=ON'
