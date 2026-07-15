@@ -14,14 +14,42 @@ permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Create staging release
+    runs-on: ubuntu-24.04
+    outputs:
+      staging_tag: ${{ steps.staging.outputs.tag }}
+    steps:
+      - name: Create run-specific staging prerelease
+        id: staging
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          staging_tag="release-staging-jemalloc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "tag=${staging_tag}" >> "$GITHUB_OUTPUT"
+
+          gh release delete "${staging_tag}" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+          gh release create "${staging_tag}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Jemalloc staging ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
+            --notes "Staged jemalloc build from ${GITHUB_SHA} with -DWITH_JEMALLOC=ON." \
+            --prerelease \
+            --draft
+
   call-build:
+    needs: prepare
     name: ${{ matrix.arch }}
     uses: ./.github/workflows/build.yml
     with:
       tag_name: jemalloc
+      release_tag_name: ${{ needs.prepare.outputs.staging_tag }}
       prerelease: true
-      upload_release_assets: false
-      upload_workflow_artifacts: true
+      release_draft: true
+      upload_release_assets: true
+      upload_workflow_artifacts: false
       with_jemalloc: true
       arch: ${{ matrix.arch }}
       os_id: ubuntu24
@@ -35,53 +63,48 @@ jobs:
 
   publish:
     name: Publish jemalloc release
-    needs: call-build
+    needs: [prepare, call-build]
+    if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Download packaged assets
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-assets-jemalloc-*
-          path: release-assets
-          merge-multiple: true
-
-      - name: Stage complete release and switch jemalloc
+      - name: Cleanup staging release after failed build
+        if: ${{ needs.call-build.result != 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STAGING_TAG: ${{ needs.prepare.outputs.staging_tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
+          gh release delete "${STAGING_TAG}" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          exit 1
 
-          assets=(release-assets/*.tar.gz)
-          expected_assets=20
-          if [ "${#assets[@]}" -ne "${expected_assets}" ]; then
-            printf 'Expected %s jemalloc assets, found %s:\n' "${expected_assets}" "${#assets[@]}" >&2
-            find release-assets -maxdepth 1 -type f -print | sort >&2
-            exit 1
-          fi
-
-          staging_tag="jemalloc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          gh release delete "${staging_tag}" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+      - name: Verify staged assets and switch jemalloc
+        if: ${{ needs.call-build.result == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STAGING_TAG: ${{ needs.prepare.outputs.staging_tag }}
+        run: |
+          set -euo pipefail
 
           cleanup_staging() {
-            gh release delete "${staging_tag}" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+            gh release delete "${STAGING_TAG}" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
           }
           trap cleanup_staging ERR
 
-          gh release create "${staging_tag}" "${assets[@]}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Jemalloc staging ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
-            --notes "Staged jemalloc build from ${GITHUB_SHA} with -DWITH_JEMALLOC=ON." \
-            --prerelease \
-            --draft
+          asset_count="$(gh release view "${STAGING_TAG}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
+          expected_assets=20
+          if [ "${asset_count}" -ne "${expected_assets}" ]; then
+            printf 'Expected %s jemalloc assets, found %s:\n' "${expected_assets}" "${asset_count}" >&2
+            gh release view "${STAGING_TAG}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' >&2
+            cleanup_staging
+            exit 1
+          fi
 
           notes_file="$(mktemp)"
           printf 'Rolling jemalloc build from %s with -DWITH_JEMALLOC=ON.\n' "$GITHUB_SHA" > "${notes_file}"
 
           gh release delete jemalloc --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
           gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/jemalloc" >/dev/null 2>&1 || true
-          gh release edit "${staging_tag}" \
+          gh release edit "${STAGING_TAG}" \
             --repo "$GITHUB_REPOSITORY" \
             --tag jemalloc \
             --target "$GITHUB_SHA" \
@@ -91,4 +114,15 @@ jobs:
             --draft=false
 
           trap - ERR
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${staging_tag}" >/dev/null 2>&1 || true
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${STAGING_TAG}" >/dev/null 2>&1 || true
+
+          if stale_tags="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == true and (.tag_name | startswith("release-staging-jemalloc-"))) | .tag_name' 2>/dev/null)"; then
+            while IFS= read -r stale_tag; do
+              [ -n "${stale_tag}" ] || continue
+              echo "Deleting stale jemalloc staging draft ${stale_tag}"
+              gh release delete "${stale_tag}" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+            done <<< "${stale_tags}"
+          else
+            echo "Skipping stale jemalloc staging draft cleanup; unable to list releases."
+          fi
