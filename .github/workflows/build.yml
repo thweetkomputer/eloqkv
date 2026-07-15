@@ -37,6 +37,10 @@ on:
         type: boolean
         default: false
         description: 'upload packaged assets as workflow artifacts'
+      with_jemalloc:
+        type: boolean
+        default: false
+        description: 'build eloqkv packages with -DWITH_JEMALLOC=ON'
 
 jobs:
   build:
@@ -59,6 +63,7 @@ jobs:
       CMAKE_INCLUDE_PATH: /opt/eloq/third_party/include
       CMAKE_LIBRARY_PATH: /opt/eloq/third_party/lib
       LD_LIBRARY_PATH: /opt/eloq/third_party/lib
+      WITH_JEMALLOC: ${{ inputs.with_jemalloc }}
 
     steps:
       - uses: actions/checkout@v4
@@ -86,13 +91,30 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          set -euo pipefail
           case "${{ inputs.package_manager }}" in
             apt)
               apt-get update -qq
-              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql-client rsync patchelf
+              apt_packages=(postgresql-client rsync patchelf)
+              if [ "${WITH_JEMALLOC}" = "true" ]; then
+                apt_packages+=(libjemalloc-dev pkg-config)
+              fi
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${apt_packages[@]}"
               ;;
-            dnf) dnf install -y postgresql-devel rsync patchelf ;;
-            yum) yum install -y postgresql-devel rsync patchelf ;;
+            dnf)
+              dnf_packages=(postgresql-devel rsync patchelf)
+              if [ "${WITH_JEMALLOC}" = "true" ]; then
+                dnf_packages+=(jemalloc-devel pkgconf-pkg-config)
+              fi
+              dnf install -y "${dnf_packages[@]}"
+              ;;
+            yum)
+              yum_packages=(postgresql-devel rsync patchelf)
+              if [ "${WITH_JEMALLOC}" = "true" ]; then
+                yum_packages+=(jemalloc-devel pkgconfig)
+              fi
+              yum install -y "${yum_packages[@]}"
+              ;;
           esac
 
       - name: Build and package all variants
@@ -144,6 +166,11 @@ jobs:
             done
           }
 
+          eloqkv_cmake_extra=()
+          if [ "${WITH_JEMALLOC}" = "true" ]; then
+            eloqkv_cmake_extra+=(-DWITH_JEMALLOC=ON)
+          fi
+
           for entry in "${VARIANTS[@]}"; do
             IFS='|' read -r id dst lst dss rtools extra <<< "$entry"
             echo "::group::Build variant ${id} (${ARCH})"
@@ -161,7 +188,8 @@ jobs:
               -DWITH_ASAN=OFF \
               -DELOQ_THIRD_PARTY_PREFIX=/opt/eloq/third_party \
               -DELOQ_THIRD_PARTY_REQUIRED=ON \
-              ${extra}
+              ${extra} \
+              "${eloqkv_cmake_extra[@]}"
             cmake --build build -j"$(nproc)"
 
             DEST_DIR="$HOME/EloqKV"
